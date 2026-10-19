@@ -1,0 +1,659 @@
+# Основной compose-файл описывает лабораторную инфраструктуру с двумя сетями:
+# internal_net - внутренняя сеть рабочих станций и серверов;
+# external_net - внешняя сеть evil-машины.
+# Единственным проводником между ними является gos_router.
+# Публикация портов наружу вынесена в docker-compose.local.yml и docker-compose.vm.yml,
+# чтобы один и тот же стенд можно было безопасно запускать на MacBook и на Ubuntu VM.
+name: ${COMPOSE_PROJECT_NAME:-gosservice_lab}
+
+# Общий env_file подключает .env ко всем контейнерам, которым нужны параметры стенда.
+x-env-file: &common_env_file
+  env_file:
+    - ./.env
+
+services:
+  # Административная рабочая станция.
+  # Через нее проверяем DNS/Web и подключаемся по RDP/SSH с хоста.
+  gos_arm_adm:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_arm_adm
+    container_name: gos_arm_adm
+    hostname: gos_arm_adm
+    restart: unless-stopped
+    # Нужен для стабильной GUI/RDP-сессии в desktop-контейнере.
+    shm_size: "1gb"
+    environment:
+      # Учетная запись создается в services/gos_arm_adm/start.sh.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+      GOS_DOMAIN: ${GOS_DOMAIN}
+    depends_on:
+      gos_router:
+        condition: service_healthy
+      # Ждем здоровый DNS, чтобы adm сразу мог резолвить внутренние имена.
+      gos_dns:
+        condition: service_healthy
+      # Web достаточно стартовать; доступность HTTP проверяется отдельно.
+      gos_web:
+        condition: service_started
+    networks:
+      # adm находится только во внутренней сети.
+      internal_net:
+        ipv4_address: ${GOS_ARM_ADM_IP}
+    dns:
+      # Принудительно используем наш лабораторный DNS.
+      - ${GOS_DNS_IP}
+    volumes:
+      # Конфигурация rsyslog, изменяемая студентом, переживает пересоздание контейнера.
+      - arm_adm_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+
+  # Пользовательская рабочая станция.
+  # Отдельный образ: GUI по RDP, SSH-доступ по паролю и почтовый клиент.
+  gos_arm_user:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_arm_user
+    container_name: gos_arm_user
+    hostname: gos_arm_user
+    restart: unless-stopped
+    shm_size: "1gb"
+    environment:
+      # Учетная запись создается в services/gos_arm_user/start.sh.
+      USER_USERNAME: ${USER_USERNAME}
+      USER_PASSWORD: ${USER_PASSWORD}
+      # Дополнительная админская учетная запись для SSH/sudo внутри user-машины.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+      GOS_DOMAIN: ${GOS_DOMAIN}
+      # Эти параметры используются для предварительной настройки Thunderbird.
+      MAIL_DOMAIN: ${MAIL_DOMAIN}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      MAIL_USER: ${MAIL_USER}
+    depends_on:
+      gos_dns:
+        condition: service_healthy
+      gos_mail:
+        condition: service_healthy
+      gos_web:
+        condition: service_started
+    networks:
+      # user-машина находится только во внутренней сети.
+      internal_net:
+        ipv4_address: ${GOS_ARM_USER_IP}
+    dns:
+      - ${GOS_DNS_IP}
+    volumes:
+      # Конфигурация rsyslog, изменяемая студентом, переживает пересоздание контейнера.
+      - arm_user_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+
+  # Двухинтерфейсный маршрутизатор между внешней и внутренней подсетями.
+  # SSH слушает только внутренний IP, а Suricata пассивно анализирует внешний интерфейс.
+  gos_router:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_router
+    container_name: gos_router
+    hostname: gos_router
+    restart: unless-stopped
+    environment:
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+      GOS_INTERNAL_SUBNET: ${GOS_INTERNAL_SUBNET}
+      GOS_EXTERNAL_SUBNET: ${GOS_EXTERNAL_SUBNET}
+      GOS_ROUTER_INTERNAL_IP: ${GOS_ROUTER_INTERNAL_IP}
+      GOS_ROUTER_EXTERNAL_IP: ${GOS_ROUTER_EXTERNAL_IP}
+      GOS_ARM_EVIL_IP: ${GOS_ARM_EVIL_IP}
+      GOS_DNS_IP: ${GOS_DNS_IP}
+      GOS_WEB_INTERNAL_IP: ${GOS_WEB_INTERNAL_IP}
+      GOS_MAIL_IP: ${GOS_MAIL_IP}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    volumes:
+      # Конфигурация локального аудита сохраняется после down/up и recreate.
+      - router_rsyslog_config:/etc/rsyslog.d
+      - suricata_logs:/var/log/suricata
+      # Полный iptables ruleset переживает restart/down/up/recreate.
+      # Сброс выполняется только вместе с удалением volumes стенда.
+      - router_firewall_state:/var/lib/gos-router-firewall
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_ROUTER_INTERNAL_IP}
+        aliases:
+          - router.${GOS_DOMAIN}
+      external_net:
+        ipv4_address: ${GOS_ROUTER_EXTERNAL_IP}
+    healthcheck:
+      # Политики iptables студент может менять, поэтому healthcheck проверяет
+      # только работоспособность маршрутизатора и его сервисов.
+      test: ["CMD-SHELL", "test \"$$(cat /proc/sys/net/ipv4/ip_forward)\" = 1 && nc -z ${GOS_ROUTER_INTERNAL_IP} 22 && test -s /run/suricata/suricata.pid && kill -0 $$(cat /run/suricata/suricata.pid)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Внешняя рабочая станция для проверки доступа через gos_router.
+  gos_arm_evil:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_arm_evil
+    container_name: gos_arm_evil
+    hostname: gos_arm_evil
+    restart: unless-stopped
+    shm_size: "1gb"
+    environment:
+      EVIL_USERNAME: ${EVIL_USERNAME}
+      EVIL_PASSWORD: ${EVIL_PASSWORD}
+      GOS_INTERNAL_SUBNET: ${GOS_INTERNAL_SUBNET}
+      GOS_ROUTER_EXTERNAL_IP: ${GOS_ROUTER_EXTERNAL_IP}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      gos_router:
+        condition: service_healthy
+    networks:
+      external_net:
+        ipv4_address: ${GOS_ARM_EVIL_IP}
+    extra_hosts:
+      - "dns.${GOS_DOMAIN}:${GOS_DNS_IP}"
+      - "site.${GOS_DOMAIN}:${GOS_WEB_INTERNAL_IP}"
+      - "mail.${GOS_DOMAIN}:${GOS_MAIL_IP}"
+      - "smtp.${GOS_DOMAIN}:${GOS_MAIL_IP}"
+      - "imap.${GOS_DOMAIN}:${GOS_MAIL_IP}"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22 && nc -z 127.0.0.1 3389 && ip route get ${GOS_WEB_INTERNAL_IP} | grep -q 'via ${GOS_ROUTER_EXTERNAL_IP}'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # DNS-сервер лабораторной зоны gos.local.
+  gos_dns:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_dns
+    container_name: gos_dns
+    hostname: gos_dns
+    restart: unless-stopped
+    environment:
+      # Эти IP используются start.sh для генерации зоны gos.local.
+      GOS_DOMAIN: ${GOS_DOMAIN}
+      GOS_EXTERNAL_SUBNET: ${GOS_EXTERNAL_SUBNET}
+      GOS_DNS_IP: ${GOS_DNS_IP}
+      GOS_ARM_ADM_IP: ${GOS_ARM_ADM_IP}
+      GOS_ARM_USER_IP: ${GOS_ARM_USER_IP}
+      GOS_ROUTER_INTERNAL_IP: ${GOS_ROUTER_INTERNAL_IP}
+      GOS_WEB_INTERNAL_IP: ${GOS_WEB_INTERNAL_IP}
+      GOS_DB_IP: ${GOS_DB_IP}
+      GOS_MAIL_IP: ${GOS_MAIL_IP}
+      GOS_WAZUH_MANAGER_IP: ${GOS_WAZUH_MANAGER_IP}
+      GOS_WAZUH_INDEXER_IP: ${GOS_WAZUH_INDEXER_IP}
+      GOS_WAZUH_DASHBOARD_IP: ${GOS_WAZUH_DASHBOARD_IP}
+      # Админская учетная запись для SSH с adm-машины.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_DNS_IP}
+        aliases:
+          # DNS-safe имена для обращения внутри docker-сети.
+          - dns.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+    cap_add:
+      # Нужен только для обратного маршрута к external_net через gos_router.
+      - NET_ADMIN
+    volumes:
+      # Bind-конфигурация создается один раз и затем остается под управлением студента.
+      - dns_bind_config:/etc/bind
+      # Конфигурация локального аудита сохраняется после down/up и recreate.
+      - dns_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+    healthcheck:
+      # Проверяем, что зона содержит и учебный сайт, и внутренний интерфейс роутера.
+      test: ["CMD-SHELL", "dig @127.0.0.1 site.${GOS_DOMAIN} +short | grep -q '${GOS_WEB_INTERNAL_IP}' && dig @127.0.0.1 router.${GOS_DOMAIN} +short | grep -q '${GOS_ROUTER_INTERNAL_IP}'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Почтовый сервер лабораторной зоны.
+  # Один контейнер с Postfix для SMTP и Dovecot для IMAP.
+  gos_mail:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_mail
+    container_name: gos_mail
+    hostname: gos_mail
+    restart: unless-stopped
+    environment:
+      # Почтовый домен и учетная запись создаются в services/gos_mail/start.sh.
+      MAIL_DOMAIN: ${MAIL_DOMAIN}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      MAIL_USER: ${MAIL_USER}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+      GOS_DNS_IP: ${GOS_DNS_IP}
+      GOS_EXTERNAL_SUBNET: ${GOS_EXTERNAL_SUBNET}
+      GOS_ROUTER_INTERNAL_IP: ${GOS_ROUTER_INTERNAL_IP}
+      # Админская учетная запись для SSH с adm-машины.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+    depends_on:
+      gos_router:
+        condition: service_healthy
+      gos_dns:
+        condition: service_healthy
+    volumes:
+      # Домашний каталог пользователя содержит Maildir с письмами.
+      - mail_home:/home
+      # Конфигурации почтовых сервисов и rsyslog сохраняют изменения студента.
+      - mail_postfix_config:/etc/postfix
+      - mail_dovecot_config:/etc/dovecot
+      - mail_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+    networks:
+      # Почтовый сервер доступен только из внутренней лабораторной сети.
+      internal_net:
+        ipv4_address: ${GOS_MAIL_IP}
+        aliases:
+          - mail.${GOS_DOMAIN}
+          - smtp.${GOS_DOMAIN}
+          - imap.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      # Проверяем SMTP, IMAP и submission-порт внутри контейнера.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 25 && nc -z 127.0.0.1 143 && nc -z 127.0.0.1 587"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Одноразовый генератор TLS-сертификатов для Wazuh Indexer/Manager/Dashboard.
+  # Сертификаты хранятся в Docker volume, а не в git-репозитории.
+  gos_siem_certs:
+    image: wazuh/wazuh-certs-generator:0.0.4
+    platform: linux/amd64
+    container_name: gos_siem_certs
+    hostname: wazuh-certs-generator
+    restart: "no"
+    environment:
+      CERT_TOOL_VERSION: "4.14"
+    # Генератор Wazuh падает при повторном запуске, если сертификаты уже существуют.
+    # Обертка делает сервис идемпотентным: готовый volume не пересоздается и не блокирует make up.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -s /certificates/root-ca.pem ] && [ -s /certificates/wazuh.indexer-key.pem ] && [ -s /certificates/wazuh.manager-key.pem ] && [ -s /certificates/wazuh.dashboard-key.pem ]; then
+          echo "Wazuh certificates already exist, fixing permissions and skipping generation."
+          chmod 755 /certificates
+          exit 0
+        fi
+        /entrypoint.sh
+        status=$$?
+        chmod 755 /certificates || true
+        exit $$status
+    volumes:
+      - wazuh_certs:/certificates
+      - ./services/gos_siem/config/certs.yml:/config/certs.yml:ro
+    networks:
+      internal_net:
+
+  # Wazuh Manager: принимает события и регистрацию агентов.
+  # Агенты на лабораторные машины здесь не устанавливаются.
+  gos_siem_manager:
+    image: wazuh/wazuh-manager:${WAZUH_VERSION}
+    platform: linux/amd64
+    container_name: gos_siem_manager
+    hostname: wazuh.manager
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    environment:
+      # Manager отправляет события в indexer и предоставляет API для dashboard.
+      INDEXER_URL: https://wazuh.indexer:9200
+      INDEXER_USERNAME: ${WAZUH_INDEXER_USERNAME}
+      INDEXER_PASSWORD: ${WAZUH_INDEXER_PASSWORD}
+      FILEBEAT_SSL_VERIFICATION_MODE: full
+      SSL_CERTIFICATE_AUTHORITIES: /wazuh-certs/root-ca-manager.pem
+      SSL_CERTIFICATE: /wazuh-certs/wazuh.manager.pem
+      SSL_KEY: /wazuh-certs/wazuh.manager-key.pem
+      API_USERNAME: ${WAZUH_API_USERNAME}
+      API_PASSWORD: ${WAZUH_API_PASSWORD}
+    depends_on:
+      gos_siem_certs:
+        condition: service_completed_successfully
+      gos_siem_indexer:
+        condition: service_started
+    volumes:
+      # Persistent volumes Wazuh Manager.
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - filebeat_etc:/etc/filebeat
+      - filebeat_var:/var/lib/filebeat
+      # TLS-сертификаты генерируются gos_siem_certs в Docker volume.
+      - wazuh_certs:/wazuh-certs:ro
+      - ./services/gos_siem/config/wazuh_cluster/wazuh_manager.conf:/wazuh-config-mount/etc/ossec.conf:ro
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_WAZUH_MANAGER_IP}
+        aliases:
+          - wazuh.manager
+          - wazuh.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+
+  # Wazuh Indexer: хранит события и индексы для dashboard.
+  gos_siem_indexer:
+    image: wazuh/wazuh-indexer:${WAZUH_VERSION}
+    platform: linux/amd64
+    container_name: gos_siem_indexer
+    hostname: wazuh.indexer
+    restart: unless-stopped
+    depends_on:
+      gos_siem_certs:
+        condition: service_completed_successfully
+    environment:
+      # Для лабораторной уменьшаем heap относительно production-рекомендаций.
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      # Persistent volume с данными indexer.
+      - wazuh_indexer_data:/var/lib/wazuh-indexer
+      - wazuh_certs:/usr/share/wazuh-indexer/config/certs:ro
+      - ./services/gos_siem/config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+      - ./services/gos_siem/config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_WAZUH_INDEXER_IP}
+        aliases:
+          - wazuh.indexer
+          - wazuh-indexer.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+
+  # Wazuh Dashboard: web-интерфейс SIEM.
+  gos_siem_dashboard:
+    image: wazuh/wazuh-dashboard:${WAZUH_VERSION}
+    platform: linux/amd64
+    container_name: gos_siem_dashboard
+    hostname: wazuh.dashboard
+    restart: unless-stopped
+    cap_add:
+      # Dashboard слушает 443 внутри lab-сети, чтобы https://siem.gos.local
+      # открывался без указания порта.
+      - NET_BIND_SERVICE
+    environment:
+      # Dashboard подключается к indexer и Wazuh Manager API.
+      INDEXER_USERNAME: ${WAZUH_INDEXER_USERNAME}
+      INDEXER_PASSWORD: ${WAZUH_INDEXER_PASSWORD}
+      WAZUH_API_URL: https://wazuh.manager
+      DASHBOARD_USERNAME: ${WAZUH_DASHBOARD_USERNAME}
+      DASHBOARD_PASSWORD: ${WAZUH_DASHBOARD_PASSWORD}
+      API_USERNAME: ${WAZUH_API_USERNAME}
+      API_PASSWORD: ${WAZUH_API_PASSWORD}
+    depends_on:
+      gos_siem_indexer:
+        condition: service_started
+      gos_siem_manager:
+        condition: service_started
+    volumes:
+      # TLS и настройки dashboard берутся из official Wazuh single-node конфигов.
+      - wazuh_certs:/usr/share/wazuh-dashboard/certs:ro
+      - ./services/gos_siem/config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./services/gos_siem/config/wazuh_dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:ro
+      - wazuh_dashboard_config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh_dashboard_custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_WAZUH_DASHBOARD_IP}
+        aliases:
+          - wazuh.dashboard
+          - siem.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+
+  # Учебный Web-сервер: nginx + PHP-FPM и скрытый CLI-инсталлятор EspoCRM.
+  # Пользователь видит только сайт из /var/www/html, а EspoCRM создает схему contact.
+  gos_web:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_web
+      args:
+        # Версии вынесены в .env, чтобы стенд можно было пересобрать под учебное задание.
+        NGINX_VERSION: ${NGINX_VERSION}
+        ESPOCRM_VERSION: ${ESPOCRM_VERSION}
+    container_name: gos_web
+    hostname: gos_web
+    restart: unless-stopped
+    environment:
+      # start.sh читает эти переменные для скрытой CLI-установки EspoCRM,
+      # а PHP-страницы сайта используют их для чтения contact.
+      ESPOCRM_VERSION: ${ESPOCRM_VERSION}
+      ESPOCRM_DATABASE_PLATFORM: Mysql
+      ESPOCRM_DATABASE_HOST: gos_db
+      ESPOCRM_DATABASE_USER: ${ESPOCRM_DB_USER}
+      ESPOCRM_DATABASE_PASSWORD: ${ESPOCRM_DB_PASSWORD}
+      ESPOCRM_DATABASE_NAME: ${ESPOCRM_DB_NAME}
+      ESPOCRM_ADMIN_USERNAME: ${ESPOCRM_ADMIN_USERNAME}
+      ESPOCRM_ADMIN_PASSWORD: ${ESPOCRM_ADMIN_PASSWORD}
+      ESPOCRM_SITE_URL: http://site.${GOS_DOMAIN}
+      # Админская учетная запись для SSH с adm-машины.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+      GOS_EXTERNAL_SUBNET: ${GOS_EXTERNAL_SUBNET}
+      GOS_ROUTER_INTERNAL_IP: ${GOS_ROUTER_INTERNAL_IP}
+    depends_on:
+      # Web стартует только после готовой БД и загруженной DNS-зоны.
+      gos_router:
+        condition: service_healthy
+      gos_db:
+        condition: service_healthy
+      gos_dns:
+        condition: service_healthy
+    volumes:
+      # Скрытая EspoCRM сохраняет install-state, а отдельный volume хранит
+      # обновленный студентом nginx и его конфигурацию.
+      - espocrm_data:/var/www/espocrm/data
+      - espocrm_custom:/var/www/espocrm/custom
+      - espocrm_client_custom:/var/www/espocrm/client/custom
+      - website_nginx:/opt/website-nginx
+      # Конфигурация локального аудита сохраняется после down/up и recreate.
+      - web_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+    healthcheck:
+      # Auth-страницы намеренно меняют поведение во время задания, поэтому
+      # healthcheck проверяет статическую страницу и доступность MariaDB отдельно.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/index.html >/dev/null && mariadb-admin ping -h\"$$ESPOCRM_DATABASE_HOST\" -u\"$$ESPOCRM_DATABASE_USER\" -p\"$$ESPOCRM_DATABASE_PASSWORD\" --silent"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      # Web находится внутри; evil достигает его через gos_router.
+      internal_net:
+        ipv4_address: ${GOS_WEB_INTERNAL_IP}
+        aliases:
+          - site.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+    cap_add:
+      - NET_ADMIN
+
+  # База данных EspoCRM.
+  gos_db:
+    <<: *common_env_file
+    build:
+      context: ./services/gos_db
+    image: ${COMPOSE_PROJECT_NAME:-gosservice_lab}-gos_db
+    container_name: gos_db
+    hostname: gos_db
+    restart: unless-stopped
+    environment:
+      # Значения берутся из .env, чтобы стенд можно было переносить без правки YAML.
+      MYSQL_DATABASE: ${ESPOCRM_DB_NAME}
+      MYSQL_USER: ${ESPOCRM_DB_USER}
+      MYSQL_PASSWORD: ${ESPOCRM_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${ESPOCRM_DB_ROOT_PASSWORD}
+      # Админская учетная запись для SSH с adm-машины.
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+    volumes:
+      # Данные БД должны переживать restart контейнера.
+      - espocrm_db:/var/lib/mysql
+      # Конфигурация локального аудита сохраняется после down/up и recreate.
+      - db_rsyslog_config:/etc/rsyslog.d
+    configs:
+      - source: gos_rsyslog_helper
+        target: /usr/local/bin/gos-rsyslog.sh
+    networks:
+      internal_net:
+        ipv4_address: ${GOS_DB_IP}
+        aliases:
+          - db.${GOS_DOMAIN}
+    dns:
+      - ${GOS_DNS_IP}
+    healthcheck:
+      # Ждем инициализацию InnoDB перед запуском EspoCRM.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Одноразовый сервис наполнения EspoCRM тестовыми контактами.
+  # Он оставлен обычным сервисом, чтобы наполнение запускалось даже при прямом docker compose up.
+  gos_db_seed:
+    <<: *common_env_file
+    image: ${COMPOSE_PROJECT_NAME:-gosservice_lab}-gos_db
+    container_name: gos_db_seed
+    hostname: gos_db_seed
+    restart: "no"
+    # Запускаем скрипт напрямую, без MariaDB entrypoint и без sshd.
+    entrypoint: ["/usr/local/bin/fill_db.sh"]
+    environment:
+      ESPOCRM_DB_HOST: gos_db
+      ESPOCRM_DB_NAME: ${ESPOCRM_DB_NAME}
+      ESPOCRM_DB_USER: ${ESPOCRM_DB_USER}
+      ESPOCRM_DB_PASSWORD: ${ESPOCRM_DB_PASSWORD}
+      LOCALADMIN_USER: ${LOCALADMIN_USER}
+      LOCALADMIN_PASSWORD: ${LOCALADMIN_PASSWORD}
+    depends_on:
+      gos_db:
+        condition: service_healthy
+      gos_web:
+        condition: service_healthy
+      gos_dns:
+        condition: service_healthy
+    networks:
+      internal_net:
+    dns:
+      - ${GOS_DNS_IP}
+
+configs:
+  # Единая логика инициализации и условного запуска rsyslog на внутренних машинах.
+  gos_rsyslog_helper:
+    file: ./services/common/gos-rsyslog.sh
+
+networks:
+  # Внутренняя сеть: рабочие станции, серверы и внутренний интерфейс роутера.
+  internal_net:
+    name: gos_internal_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${GOS_INTERNAL_SUBNET}
+
+  # Внешняя сеть: evil-машина и внешний интерфейс роутера.
+  external_net:
+    name: gos_external_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${GOS_EXTERNAL_SUBNET}
+
+volumes:
+  # Persistent rsyslog configuration on all internal lab machines.
+  arm_adm_rsyslog_config:
+  arm_user_rsyslog_config:
+  router_rsyslog_config:
+  dns_rsyslog_config:
+  web_rsyslog_config:
+  db_rsyslog_config:
+  # Bind configuration changed by the student.
+  dns_bind_config:
+  # Postfix, Dovecot and mail rsyslog configuration changed by the student.
+  mail_postfix_config:
+  mail_dovecot_config:
+  mail_rsyslog_config:
+  # Persistent volumes EspoCRM.
+  espocrm_data:
+  espocrm_custom:
+  espocrm_client_custom:
+  # Nginx binary/config учебного сайта, изменяемые студентом.
+  website_nginx:
+  # Persistent volume MariaDB.
+  espocrm_db:
+  # Persistent volume почтового ящика.
+  mail_home:
+  # Persistent volume событий Suricata на gos_router.
+  suricata_logs:
+  # Полный iptables ruleset, изменяемый студентом на gos_router.
+  router_firewall_state:
+  # Runtime-generated TLS certificates for Wazuh.
+  wazuh_certs:
+  # Persistent volumes Wazuh Manager.
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  filebeat_etc:
+  filebeat_var:
+  # Persistent volumes Wazuh Indexer/Dashboard.
+  wazuh_indexer_data:
+  wazuh_dashboard_config:
+  wazuh_dashboard_custom:

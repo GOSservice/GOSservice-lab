@@ -1,0 +1,52 @@
+---
+# This is the internal user database. The admin and kibanaserver hashes match
+# the complex Wazuh passwords in .env.example.
+
+_meta:
+  type: "internalusers"
+  config_version: 2
+
+admin:
+  hash: "$2y$12$F6PjlhRtKWfDPSptJ1Nk6O9yTlB5XiFJ9RCcv/ibkNb7PgiR8/rEm"
+  reserved: true
+  backend_roles:
+  - "admin"
+  description: "GOSservice Wazuh administrator"
+
+kibanaserver:
+  hash: "$2y$12$6PTZSsGtfWZO/.3eRd2zLuGIgvmUhVzChWWA/32Mzgqi7FYReE/Vq"
+  reserved: true
+  description: "Wazuh dashboard service user"
+
+kibanaro:
+  hash: "$2a$12$JJSXNfTowz7Uu5ttXfeYpeYE0arACvcwlPBStB1F.MI7f0U9Z4DGC"
+  reserved: false
+  backend_roles:
+  - "kibanauser"
+  - "readall"
+  attributes:
+    attribute1: "value1"
+    attribute2: "value2"
+    attribute3: "value3"
+  description: "Demo kibanaro user"
+
+logstash:
+  hash: "$2a$12$u1ShR4l4uBS3Uv59Pa2y5.1uQuZBrZtmNfqB3iM/.jL0XoV9sghS2"
+  reserved: false
+  backend_roles:
+  - "logstash"
+  description: "Demo logstash user"
+
+readall:
+  hash: "$2a$12$ae4ycwzwvLtZxwZ82RmiEunBbIPiAmGZduBAjKN0TXdwQFtCwARz2"
+  reserved: false
+  backend_roles:
+  - "readall"
+  description: "Demo readall user"
+
+snapshotrestore:
+  hash: "$2y$12$DpwmetHKwgYnorbgdvORCenv4NAK8cPUg8AI6pxLCuWf/ALc0.v7W"
+  reserved: false
+  backend_roles:
+  - "snapshotrestore"
+  description: "Demo snapshotrestore user"

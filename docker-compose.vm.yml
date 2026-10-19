@@ -1,0 +1,34 @@
+# Override для Ubuntu VM.
+# Порты слушают 0.0.0.0, поэтому к ним можно подключаться извне,
+# если firewall/сетевые правила VM это разрешают.
+services:
+  gos_arm_adm:
+    ports:
+      # RDP к adm снаружи VM.
+      - "0.0.0.0:${ADM_RDP_HOST_PORT}:3389/tcp"
+      # SSH к adm снаружи VM.
+      - "0.0.0.0:${ADM_SSH_HOST_PORT}:22/tcp"
+
+  gos_arm_user:
+    ports:
+      # RDP к user снаружи VM.
+      - "0.0.0.0:${USER_RDP_HOST_PORT}:3389/tcp"
+      # SSH к user снаружи VM.
+      - "0.0.0.0:${USER_SSH_HOST_PORT}:22/tcp"
+
+  gos_arm_evil:
+    ports:
+      # RDP к evil снаружи Ubuntu VM.
+      - "0.0.0.0:${EVIL_RDP_HOST_PORT}:3389/tcp"
+      # SSH к evil снаружи Ubuntu VM.
+      - "0.0.0.0:${EVIL_SSH_HOST_PORT}:22/tcp"
+
+  gos_web:
+    ports:
+      # HTTP к учебному сайту снаружи VM.
+      - "0.0.0.0:${WEBSITE_HTTP_HOST_PORT}:80/tcp"
+
+  gos_siem_dashboard:
+    ports:
+      # HTTPS к Wazuh Dashboard снаружи VM.
+      - "0.0.0.0:${WAZUH_DASHBOARD_HOST_PORT}:443/tcp"
